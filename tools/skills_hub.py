@@ -2586,6 +2586,36 @@ def install_from_quarantine(
     install_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(quarantine_path), str(install_dir))
 
+    # Register with SkillRegistry (lazy import to avoid circular dependency)
+    try:
+        from agent.skill_registry import SkillEntry, registry
+
+        skill_md = install_dir / "SKILL.md"
+        if skill_md.exists():
+            try:
+                content = skill_md.read_text(encoding="utf-8")
+                import re as _re
+
+                yaml_match = _re.search(r"\n---\s*\n(.*?)\n---\s*\n", content, _re.DOTALL)
+                if yaml_match:
+                    import yaml as _yaml
+
+                    _loader = getattr(_yaml, "CSafeLoader", None) or _yaml.SafeLoader
+                    frontmatter = _yaml.load(yaml_match.group(1), Loader=_loader)
+                    if isinstance(frontmatter, dict):
+                        entry = SkillEntry.from_frontmatter(
+                            name=skill_name,
+                            path=skill_md,
+                            frontmatter=frontmatter,
+                            source="hub",
+                            description=str(frontmatter.get("description", "")),
+                        )
+                        registry.register(entry)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # Record in lock file
     lock = HubLockFile()
     lock.record_install(
@@ -2606,6 +2636,14 @@ def install_from_quarantine(
         content_hash(install_dir),
     )
 
+    # Refresh skill-commands cache so the new skill is immediately available as /<slug>
+    try:
+        from agent.skill_commands import reset_skill_commands_cache
+
+        reset_skill_commands_cache()
+    except Exception:
+        pass
+
     return install_dir
 
 
@@ -2620,8 +2658,24 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     if install_path.exists():
         shutil.rmtree(install_path)
 
+    # Deregister from SkillRegistry (lazy import to avoid circular dependency)
+    try:
+        from agent.skill_registry import registry
+
+        registry.deregister(skill_name)
+    except Exception:
+        pass
+
     lock.record_uninstall(skill_name)
     append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+
+    # Refresh skill-commands cache so the removed skill is no longer available as /<slug>
+    try:
+        from agent.skill_commands import reset_skill_commands_cache
+
+        reset_skill_commands_cache()
+    except Exception:
+        pass
 
     return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
 

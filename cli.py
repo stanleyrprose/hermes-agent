@@ -1921,7 +1921,7 @@ class HermesCLI:
         self._startup_skills_line_shown = False
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
-        self._voice_lock = threading.Lock()
+        self._voice_lock = threading.RLock()
         self._voice_mode = False
         self._voice_tts = False
         self._voice_recorder = None
@@ -7219,7 +7219,6 @@ class HermesCLI:
             if wav_path is None:
                 _cprint(f"{_DIM}No speech detected.{_RST}")
                 return
-
             # _voice_processing is already True (set atomically above)
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
@@ -8710,7 +8709,7 @@ class HermesCLI:
         self._image_counter = 0
 
         # Voice mode state (protected by _voice_lock for cross-thread access)
-        self._voice_lock = threading.Lock()
+        self._voice_lock = threading.RLock()
         self._voice_mode = False        # Whether voice mode is enabled
         self._voice_tts = False         # Whether TTS output is enabled
         self._voice_recorder = None     # AudioRecorder instance (lazy init)

@@ -415,6 +415,11 @@ class AudioRecorder:
     # -- public properties ---------------------------------------------------
 
     @property
+    def is_recording(self) -> bool:
+        """True while a recording is in progress (start called and not yet stopped/cancelled)."""
+        return self._recording
+
+    @property
     def elapsed_seconds(self) -> float:
         if not self._recording:
             return 0.0

@@ -47,6 +47,29 @@ def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[st
     save_config(config)
 
 
+# ─── Platform Skillsets (unified with tools_config structure) ─────────────────
+
+def get_enabled_skillsets(config: dict, platform: str) -> Optional[List[str]]:
+    """Return enabled skillset names for a platform, or None if using defaults.
+
+    Mirrors the structure of platform_toolsets in tools_config.py.
+    Returns None when no explicit config exists (use defaults).
+    """
+    skills_cfg = config.get("skills", {})
+    return skills_cfg.get("platform_skillsets", {}).get(platform)
+
+
+def save_enabled_skillsets(config: dict, enabled: Set[str], platform: str):
+    """Persist enabled skillset names for a platform.
+
+    Mirrors the structure of platform_toolsets in tools_config.py.
+    """
+    config.setdefault("skills", {})
+    config["skills"].setdefault("platform_skillsets", {})
+    config["skills"]["platform_skillsets"][platform] = sorted(enabled)
+    save_config(config)
+
+
 # ─── Skill Discovery ─────────────────────────────────────────────────────────
 
 def _list_all_skills() -> List[dict]:

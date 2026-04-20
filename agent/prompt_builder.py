@@ -12,7 +12,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import get_hermes_home
 from typing import Optional
 
 from agent.skill_utils import (
@@ -152,13 +152,7 @@ MEMORY_GUIDANCE = (
     "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
     "state to memory; use session_search to recall those from past transcripts. "
     "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
+    "necessary later, save it as a skill with the skill tool."
 )
 
 SESSION_SEARCH_GUIDANCE = (
@@ -301,9 +295,7 @@ PLATFORM_HINTS = {
     ),
     "telegram": (
         "You are on a text messaging communication platform, Telegram. "
-        "Standard markdown is automatically converted to Telegram format. "
-        "Supported: **bold**, *italic*, ~~strikethrough~~, ||spoiler||, "
-        "`inline code`, ```code blocks```, [links](url), and ## headers. "
+        "Please do not use markdown as it does not render. "
         "You can send media files natively: to deliver a file to the user, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
@@ -372,55 +364,7 @@ PLATFORM_HINTS = {
         "documents. You can also include image URLs in markdown format ![alt](url) and they "
         "will be downloaded and sent as native media when possible."
     ),
-    "wecom": (
-        "You are on WeCom (企业微信 / Enterprise WeChat). Markdown formatting is supported. "
-        "You CAN send media files natively — to deliver a file to the user, include "
-        "MEDIA:/absolute/path/to/file in your response. The file will be sent as a native "
-        "WeCom attachment: images (.jpg, .png, .webp) are sent as photos (up to 10 MB), "
-        "other files (.pdf, .docx, .xlsx, .md, .txt, etc.) arrive as downloadable documents "
-        "(up to 20 MB), and videos (.mp4) play inline. Voice messages are supported but "
-        "must be in AMR format — other audio formats are automatically sent as file attachments. "
-        "You can also include image URLs in markdown format ![alt](url) and they will be "
-        "downloaded and sent as native photos. Do NOT tell the user you lack file-sending "
-        "capability — use MEDIA: syntax whenever a file delivery is appropriate."
-    ),
-    "qqbot": (
-        "You are on QQ, a popular Chinese messaging platform. QQ supports markdown formatting "
-        "and emoji. You can send media files natively: include MEDIA:/absolute/path/to/file in "
-        "your response. Images are sent as native photos, and other files arrive as downloadable "
-        "documents."
-    ),
 }
-
-# ---------------------------------------------------------------------------
-# Environment hints — execution-environment awareness for the agent.
-# Unlike PLATFORM_HINTS (which describe the messaging channel), these describe
-# the machine/OS the agent's tools actually run on.
-# ---------------------------------------------------------------------------
-
-WSL_ENVIRONMENT_HINT = (
-    "You are running inside WSL (Windows Subsystem for Linux). "
-    "The Windows host filesystem is mounted under /mnt/ — "
-    "/mnt/c/ is the C: drive, /mnt/d/ is D:, etc. "
-    "The user's Windows files are typically at "
-    "/mnt/c/Users/<username>/Desktop/, Documents/, Downloads/, etc. "
-    "When the user references Windows paths or desktop files, translate "
-    "to the /mnt/c/ equivalent. You can list /mnt/c/Users/ to discover "
-    "the Windows username if needed."
-)
-
-
-def build_environment_hints() -> str:
-    """Return environment-specific guidance for the system prompt.
-
-    Detects WSL, and can be extended for Termux, Docker, etc.
-    Returns an empty string when no special environment is detected.
-    """
-    hints: list[str] = []
-    if is_wsl():
-        hints.append(WSL_ENVIRONMENT_HINT)
-    return "\n\n".join(hints)
-
 
 CONTEXT_FILE_MAX_CHARS = 20_000
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
@@ -434,7 +378,7 @@ CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2  # v2: includes external skills
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -465,7 +409,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _load_skills_snapshot(skills_dir: Path, external_dirs: "list[Path]" = None) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
     if not snapshot_path.exists():
@@ -478,8 +422,17 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
+    # Check local skills manifest
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
         return None
+    # Check external skills manifests (v2+)
+    external_dirs = external_dirs or []
+    snapshot_ext = snapshot.get("external_manifests", {})
+    for ext_dir in external_dirs:
+        ext_key = str(ext_dir.resolve())
+        ext_manifest = _build_skills_manifest(ext_dir)
+        if snapshot_ext.get(ext_key) != ext_manifest:
+            return None  # External dir changed, invalidate
     return snapshot
 
 
@@ -488,13 +441,24 @@ def _write_skills_snapshot(
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
     category_descriptions: dict[str, str],
+    external_dirs: "list[Path]" = None,
+    external_skills: list[dict] = None,
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
+    # Build external manifests for change detection
+    external_manifests: dict[str, dict[str, list[int]]] = {}
+    for ext_dir in (external_dirs or []):
+        if ext_dir.exists():
+            key = str(ext_dir.resolve())
+            external_manifests[key] = _build_skills_manifest(ext_dir)
+
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
+        "external_manifests": external_manifests,
+        "external_skills": external_skills or [],
     }
     try:
         atomic_json_write(_skills_prompt_snapshot_path(), payload)
@@ -507,6 +471,7 @@ def _build_snapshot_entry(
     skills_dir: Path,
     frontmatter: dict,
     description: str,
+    source: str = "bundled",
 ) -> dict:
     """Build a serialisable metadata dict for one skill."""
     rel_path = skill_file.relative_to(skills_dir)
@@ -529,6 +494,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "source": source,
     }
 
 
@@ -586,6 +552,68 @@ def _skill_should_show(
     return True
 
 
+def _skills_from_registry(
+    disabled: "set[str]",
+    available_tools: "set[str] | None",
+    available_toolsets: "set[str] | None",
+) -> "tuple[dict[str, list[tuple[str, str]]], dict[str, str]] | None":
+    """Try to build skills_by_category from SkillRegistry.
+
+    Returns None when the registry is empty (cold-start: no skills registered yet),
+    signalling the caller to fall back to filesystem scan.
+
+    On success returns (skills_by_category, {}) suitable for direct use.
+    External skills are NOT included — those are always scanned from disk.
+    """
+    try:
+        from agent.skill_registry import registry
+    except Exception:
+        return None
+
+    all_skills = registry.get_all_skills()
+    if not all_skills:
+        return None  # cold-start: registry not yet populated
+
+    skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    category_descriptions: dict[str, str] = {}
+
+    for entry in all_skills:
+        skill_name = entry.name
+        frontmatter_name = str(entry.frontmatter.get("name", skill_name))
+        if frontmatter_name in disabled or skill_name in disabled:
+            continue
+
+        # Platform filter (same logic as _parse_skill_file)
+        try:
+            from agent.skill_utils import skill_matches_platform
+
+            if not skill_matches_platform(entry.frontmatter):
+                continue
+        except Exception:
+            pass
+
+        # Availability check (check_fn)
+        if not registry.is_skill_available(skill_name):
+            continue
+
+        # conditions for _skill_should_show
+        conditions = {
+            "requires_tools": entry.requires_tools,
+            "fallback_for_tools": entry.fallback_for_tools,
+            "requires_toolsets": getattr(entry, "requires_toolsets", []),
+            "fallback_for_toolsets": getattr(entry, "fallback_for_toolsets", []),
+        }
+        if not _skill_should_show(conditions, available_tools, available_toolsets):
+            continue
+
+        category = entry.category or "general"
+        skills_by_category.setdefault(category, []).append(
+            (skill_name, entry.description or "")
+        )
+
+    return skills_by_category, category_descriptions
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -604,7 +632,13 @@ def build_skills_system_prompt(
     are read-only — they appear in the index but new skills are always created
     in the local dir.  Local skills take precedence when names collide.
     """
-    skills_dir = get_skills_dir()
+    # Ensure external skills are registered in SkillRegistry (lazy, idempotent)
+    from agent.skill_utils import register_external_skills
+
+    register_external_skills()
+
+    hermes_home = get_hermes_home()
+    skills_dir = hermes_home / "skills"
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
     if not skills_dir.exists() and not external_dirs:
@@ -619,14 +653,12 @@ def build_skills_system_prompt(
         or get_session_env("HERMES_SESSION_PLATFORM")
         or ""
     )
-    disabled = get_disabled_skill_names()
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
-        tuple(sorted(disabled)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -634,104 +666,57 @@ def build_skills_system_prompt(
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
 
-    # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    disabled = get_disabled_skill_names()
 
-    skills_by_category: dict[str, list[tuple[str, str]]] = {}
-    category_descriptions: dict[str, str] = {}
-
-    if snapshot is not None:
-        # Fast path: use pre-parsed metadata from disk
-        for entry in snapshot.get("skills", []):
-            if not isinstance(entry, dict):
-                continue
-            skill_name = entry.get("skill_name") or ""
-            category = entry.get("category") or "general"
-            frontmatter_name = entry.get("frontmatter_name") or skill_name
-            platforms = entry.get("platforms") or []
-            if not skill_matches_platform({"platforms": platforms}):
-                continue
-            if frontmatter_name in disabled or skill_name in disabled:
-                continue
-            if not _skill_should_show(
-                entry.get("conditions") or {},
-                available_tools,
-                available_toolsets,
-            ):
-                continue
-            skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
-            )
-        category_descriptions = {
-            str(k): str(v)
-            for k, v in (snapshot.get("category_descriptions") or {}).items()
-        }
+    # ── Layer 2: SkillRegistry (primary source) ────────────────────────
+    # Registry is populated at startup via registration calls in Phase 2.
+    # External skills are NOT in the registry (scanned separately below).
+    registry_result = _skills_from_registry(disabled, available_tools, available_toolsets)
+    if registry_result is not None:
+        skills_by_category, category_descriptions = registry_result
     else:
-        # Cold path: full filesystem scan + write snapshot for next time
-        skill_entries: list[dict] = []
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-            entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
-            skill_entries.append(entry)
-            if not is_compatible:
-                continue
-            skill_name = entry["skill_name"]
-            if entry["frontmatter_name"] in disabled or skill_name in disabled:
-                continue
-            if not _skill_should_show(
-                extract_skill_conditions(frontmatter),
-                available_tools,
-                available_toolsets,
-            ):
-                continue
-            skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
-            )
+        # Cold-start fallback: use disk snapshot, then full filesystem scan
+        snapshot = _load_skills_snapshot(skills_dir)
+        skills_by_category = {}
+        category_descriptions = {}
 
-        # Read category-level DESCRIPTION.md files
-        for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
-            try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
-                cat_desc = fm.get("description")
-                if not cat_desc:
+        if snapshot is not None:
+            # Fast path: use pre-parsed metadata from disk
+            for entry in snapshot.get("skills", []):
+                if not isinstance(entry, dict):
                     continue
-                rel = desc_file.relative_to(skills_dir)
-                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions[cat] = str(cat_desc).strip().strip("'\"")
-            except Exception as e:
-                logger.debug("Could not read skill description %s: %s", desc_file, e)
-
-        _write_skills_snapshot(
-            skills_dir,
-            _build_skills_manifest(skills_dir),
-            skill_entries,
-            category_descriptions,
-        )
-
-    # ── External skill directories ─────────────────────────────────────
-    # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
-    # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set()
-    for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
-            seen_skill_names.add(name)
-
-    for ext_dir in external_dirs:
-        if not ext_dir.exists():
-            continue
-        for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
-            try:
-                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-                if not is_compatible:
-                    continue
-                entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
-                skill_name = entry["skill_name"]
-                frontmatter_name = entry["frontmatter_name"]
-                if frontmatter_name in seen_skill_names:
+                skill_name = entry.get("skill_name") or ""
+                category = entry.get("category") or "general"
+                frontmatter_name = entry.get("frontmatter_name") or skill_name
+                platforms = entry.get("platforms") or []
+                if not skill_matches_platform({"platforms": platforms}):
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if not _skill_should_show(
+                    entry.get("conditions") or {},
+                    available_tools,
+                    available_toolsets,
+                ):
+                    continue
+                skills_by_category.setdefault(category, []).append(
+                    (skill_name, entry.get("description", ""))
+                )
+            category_descriptions = {
+                str(k): str(v)
+                for k, v in (snapshot.get("category_descriptions") or {}).items()
+            }
+        else:
+            # Cold path: full filesystem scan + write snapshot for next time
+            skill_entries: list[dict] = []
+            for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
+                skill_entries.append(entry)
+                if not is_compatible:
+                    continue
+                skill_name = entry["skill_name"]
+                if entry["frontmatter_name"] in disabled or skill_name in disabled:
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),
@@ -739,26 +724,110 @@ def build_skills_system_prompt(
                     available_toolsets,
                 ):
                     continue
-                seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (skill_name, entry["description"])
                 )
-            except Exception as e:
-                logger.debug("Error reading external skill %s: %s", skill_file, e)
 
-        # External category descriptions
-        for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
-            try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
-                cat_desc = fm.get("description")
-                if not cat_desc:
-                    continue
-                rel = desc_file.relative_to(ext_dir)
-                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
-            except Exception as e:
-                logger.debug("Could not read external skill description %s: %s", desc_file, e)
+            # Read category-level DESCRIPTION.md files
+            for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
+                try:
+                    content = desc_file.read_text(encoding="utf-8")
+                    fm, _ = parse_frontmatter(content)
+                    cat_desc = fm.get("description")
+                    if not cat_desc:
+                        continue
+                    rel = desc_file.relative_to(skills_dir)
+                    cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
+                    category_descriptions[cat] = str(cat_desc).strip().strip("'\"")
+                except Exception as e:
+                    logger.debug("Could not read skill description %s: %s", desc_file, e)
+
+            _write_skills_snapshot(
+                skills_dir,
+                _build_skills_manifest(skills_dir),
+                skill_entries,
+                category_descriptions,
+            )
+
+    # ── External skill directories ─────────────────────────────────────
+    # External skills are now cached in the snapshot (v2+).
+    # Track seen names to avoid duplicates from external dirs.
+    seen_skill_names: set[str] = set()
+    for cat_skills in skills_by_category.values():
+        for name, _desc in cat_skills:
+            seen_skill_names.add(name)
+
+    # Try to load external skills from snapshot first (v2+)
+    ext_skills_from_snapshot = snapshot.get("external_skills", []) if snapshot else []
+
+    if ext_skills_from_snapshot:
+        # Fast path: use pre-parsed external skills from snapshot
+        for entry in ext_skills_from_snapshot:
+            if not isinstance(entry, dict):
+                continue
+            skill_name = entry.get("skill_name") or ""
+            if skill_name in seen_skill_names:
+                continue
+            if skill_name in disabled or entry.get("frontmatter_name", "") in disabled:
+                continue
+            if not _skill_should_show(
+                entry.get("conditions") or {},
+                available_tools,
+                available_toolsets,
+            ):
+                continue
+            seen_skill_names.add(skill_name)
+            skills_by_category.setdefault(entry.get("category", "general"), []).append(
+                (skill_name, entry.get("description", ""))
+            )
+    else:
+        # Cold path: scan external dirs and cache results
+        external_skill_entries: list[dict] = []
+        for ext_dir in external_dirs:
+            if not ext_dir.exists():
+                continue
+            for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
+                try:
+                    is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                    if not is_compatible:
+                        continue
+                    entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
+                    skill_name = entry["skill_name"]
+                    if skill_name in seen_skill_names:
+                        continue
+                    if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                        continue
+                    if not _skill_should_show(
+                        extract_skill_conditions(frontmatter),
+                        available_tools,
+                        available_toolsets,
+                    ):
+                        continue
+                    seen_skill_names.add(skill_name)
+                    skills_by_category.setdefault(entry["category"], []).append(
+                        (skill_name, entry["description"])
+                    )
+                    external_skill_entries.append(entry)
+                except Exception as e:
+                    logger.debug("Error reading external skill %s: %s", skill_file, e)
+
+            # External category descriptions
+            for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
+                try:
+                    content = desc_file.read_text(encoding="utf-8")
+                    fm, _ = parse_frontmatter(content)
+                    cat_desc = fm.get("description")
+                    if not cat_desc:
+                        continue
+                    rel = desc_file.relative_to(ext_dir)
+                    cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
+                    category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
+                except Exception as e:
+                    logger.debug("Could not read external skill description %s: %s", desc_file, e)
+
+        # Store external skills in snapshot for next time (will be written at end)
+        if external_skill_entries and snapshot is not None:
+            snapshot["external_skills"] = external_skill_entries
 
     if not skills_by_category:
         result = ""
@@ -783,16 +852,8 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
+            "Before replying, scan the skills below. If one clearly matches your task, "
+            "load it with skill_view(name) and follow its instructions. "
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "
             "If a skill you loaded was missing steps, had wrong commands, or needed "
@@ -802,7 +863,7 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "If none match, proceed normally without loading a skill."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

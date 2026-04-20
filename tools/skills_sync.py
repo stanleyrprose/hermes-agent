@@ -24,10 +24,12 @@ The manifest lives at ~/.hermes/skills/.bundled_manifest.
 import hashlib
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
-from hermes_constants import get_hermes_home
 from typing import Dict, List, Tuple
+
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +216,7 @@ def sync_skills(quiet: bool = False) -> dict:
                     shutil.copytree(skill_src, dest)
                     copied.append(skill_name)
                     manifest[skill_name] = bundled_hash
+                    _register_skill_dir(dest, source="bundled")
                     if not quiet:
                         print(f"  + {skill_name}")
             except (OSError, IOError) as e:
@@ -254,6 +257,7 @@ def sync_skills(quiet: bool = False) -> dict:
                         shutil.copytree(skill_src, dest)
                         manifest[skill_name] = bundled_hash
                         updated.append(skill_name)
+                        _register_skill_dir(dest, source="bundled")
                         if not quiet:
                             print(f"  ↑ {skill_name} (updated)")
                         # Remove backup after successful copy
@@ -301,102 +305,63 @@ def sync_skills(quiet: bool = False) -> dict:
     }
 
 
-def reset_bundled_skill(name: str, restore: bool = False) -> dict:
+# ── SkillRegistry integration ───────────────────────────────────────────────────
+
+
+def _register_skill_dir(skill_dir: Path, source: str = "bundled") -> None:
+    """Register a bundled skill with SkillRegistry after a successful copy/update.
+
+    Reads the SKILL.md frontmatter and registers with the process-global
+    SkillRegistry so the skill is immediately discoverable without a rescan.
+    Silently succeeds if the skill file is missing or malformed.
     """
-    Reset a bundled skill's manifest tracking so future syncs work normally.
+    try:
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            return
+        content = skill_md.read_text(encoding="utf-8")
+    except Exception:
+        return
 
-    When a user edits a bundled skill, subsequent syncs mark it as
-    ``user_modified`` and skip it forever — even if the user later copies
-    the bundled version back into place, because the manifest still holds
-    the *old* origin hash. This function breaks that loop.
+    # Parse frontmatter
+    yaml_match = re.search(r"\n---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+    if not yaml_match:
+        return
+    try:
+        import yaml
 
-    Args:
-        name: The skill name (matches the manifest key / skill frontmatter name).
-        restore: If True, also delete the user's copy in SKILLS_DIR and let
-                 the next sync re-copy the current bundled version. If False
-                 (default), only clear the manifest entry — the user's
-                 current copy is preserved but future updates work again.
+        loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+        frontmatter = yaml.load(yaml_match.group(1), Loader=loader)
+        if not isinstance(frontmatter, dict):
+            return
+    except Exception:
+        return
 
-    Returns:
-        dict with keys:
-          - ok: bool, whether the reset succeeded
-          - action: one of "manifest_cleared", "restored", "not_in_manifest",
-                    "bundled_missing"
-          - message: human-readable description
-          - synced: dict from sync_skills() if a sync was triggered, else None
-    """
-    manifest = _read_manifest()
-    bundled_dir = _get_bundled_dir()
-    bundled_skills = _discover_bundled_skills(bundled_dir)
-    bundled_by_name = {skill_name: skill_dir for skill_name, skill_dir in bundled_skills}
+    name = frontmatter.get("name", skill_dir.name)
+    description = frontmatter.get("description", "")
 
-    in_manifest = name in manifest
-    is_bundled = name in bundled_by_name
+    # Infer category from path
+    category = None
+    try:
+        rel = skill_dir.relative_to(SKILLS_DIR)
+        parts = rel.parts
+        if len(parts) >= 2:
+            category = parts[0]
+    except ValueError:
+        pass
 
-    if not in_manifest and not is_bundled:
-        return {
-            "ok": False,
-            "action": "not_in_manifest",
-            "message": (
-                f"'{name}' is not a tracked bundled skill. Nothing to reset. "
-                f"(Hub-installed skills use `hermes skills uninstall`.)"
-            ),
-            "synced": None,
-        }
+    # Import here to avoid circular dependency at module load time
+    from agent.skill_registry import SkillEntry, registry
 
-    # Step 1: drop the manifest entry so next sync treats it as new
-    if in_manifest:
-        del manifest[name]
-        _write_manifest(manifest)
-
-    # Step 2 (optional): delete the user's copy so next sync re-copies bundled
-    deleted_user_copy = False
-    if restore:
-        if not is_bundled:
-            return {
-                "ok": False,
-                "action": "bundled_missing",
-                "message": (
-                    f"'{name}' has no bundled source — manifest entry cleared "
-                    f"but cannot restore from bundled (skill was removed upstream)."
-                ),
-                "synced": None,
-            }
-        # The destination mirrors the bundled path relative to bundled_dir.
-        dest = _compute_relative_dest(bundled_by_name[name], bundled_dir)
-        if dest.exists():
-            try:
-                shutil.rmtree(dest)
-                deleted_user_copy = True
-            except (OSError, IOError) as e:
-                return {
-                    "ok": False,
-                    "action": "manifest_cleared",
-                    "message": (
-                        f"Cleared manifest entry for '{name}' but could not "
-                        f"delete user copy at {dest}: {e}"
-                    ),
-                    "synced": None,
-                }
-
-    # Step 3: run sync to re-baseline (or re-copy if we deleted)
-    synced = sync_skills(quiet=True)
-
-    if restore and deleted_user_copy:
-        action = "restored"
-        message = f"Restored '{name}' from bundled source."
-    elif restore:
-        # Nothing on disk to delete, but we re-synced — acts like a fresh install
-        action = "restored"
-        message = f"Restored '{name}' (no prior user copy, re-copied from bundled)."
-    else:
-        action = "manifest_cleared"
-        message = (
-            f"Cleared manifest entry for '{name}'. Future `hermes update` runs "
-            f"will re-baseline against your current copy and accept upstream changes."
-        )
-
-    return {"ok": True, "action": action, "message": message, "synced": synced}
+    entry = SkillEntry.from_frontmatter(
+        name=str(name),
+        path=skill_md,
+        frontmatter=frontmatter,
+        source=source,
+        description=str(description) if description else "",
+        category=category,
+    )
+    registry.register(entry)
 
 
 if __name__ == "__main__":

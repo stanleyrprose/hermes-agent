@@ -343,6 +343,20 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    # Register with SkillRegistry (lazy import to avoid circular dependency)
+    try:
+        from agent.skill_registry import SkillEntry, registry
+
+        entry = SkillEntry(
+            name=name,
+            source="user",
+            path=skill_md,
+            category=category,
+        )
+        registry.register(entry)
+    except Exception:
+        pass  # Non-fatal — skill still works, registry just not updated
+
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
@@ -355,6 +369,15 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
+
+    # Refresh skill-commands cache so the new skill is immediately available as /<slug>
+    try:
+        from agent.skill_commands import reset_skill_commands_cache
+
+        reset_skill_commands_cache()
+    except Exception:
+        pass
+
     return result
 
 
@@ -386,6 +409,28 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         if original_content is not None:
             _atomic_write_text(skill_md, original_content)
         return {"success": False, "error": scan_error}
+
+    # Re-register with SkillRegistry (lazy import to avoid circular dependency)
+    try:
+        from agent.skill_registry import SkillEntry, registry
+
+        entry = SkillEntry(
+            name=name,
+            source="user",
+            path=skill_md,
+            category=existing.get("category"),
+        )
+        registry.register(entry)
+    except Exception:
+        pass  # Non-fatal
+
+    # Refresh skill-commands cache so edits are reflected immediately
+    try:
+        from agent.skill_commands import reset_skill_commands_cache
+
+        reset_skill_commands_cache()
+    except Exception:
+        pass
 
     return {
         "success": True,
@@ -497,10 +542,26 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     skill_dir = existing["path"]
     shutil.rmtree(skill_dir)
 
+    # Deregister from SkillRegistry (lazy import to avoid circular dependency)
+    try:
+        from agent.skill_registry import registry
+
+        registry.deregister(name)
+    except Exception:
+        pass  # Non-fatal
+
     # Clean up empty category directories (don't remove SKILLS_DIR itself)
     parent = skill_dir.parent
     if parent != SKILLS_DIR and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
+
+    # Refresh skill-commands cache so the deleted skill is no longer available as /<slug>
+    try:
+        from agent.skill_commands import reset_skill_commands_cache
+
+        reset_skill_commands_cache()
+    except Exception:
+        pass
 
     return {
         "success": True,

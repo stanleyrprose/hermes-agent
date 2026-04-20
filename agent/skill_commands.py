@@ -206,21 +206,78 @@ def _build_skill_message(
     return "\n".join(parts)
 
 
+def _skills_dir_is_default() -> bool:
+    """Check whether SKILLS_DIR still points to the real user directory.
+
+    Tests patch ``tools.skills_tool.SKILLS_DIR`` to a temp path.  When that
+    happens the registry (which was populated at process startup from the real
+    directory) will not see the test skills, so we must fall back to a direct
+    filesystem scan.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        from tools.skills_tool import SKILLS_DIR
+
+        default = get_hermes_home() / "skills"
+        return SKILLS_DIR.resolve().parent == default.resolve().parent
+    except Exception:
+        return True  # assume normal operation on errors
+
+
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
-    """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
+    """Build the skill-commands mapping from SkillRegistry (primary) or filesystem.
 
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands
     _skill_commands = {}
-    try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs
-        disabled = _get_disabled_skill_names()
-        seen_names: set = set()
 
-        # Scan local dir first, then external dirs
+    try:
+        disabled = _get_disabled_skill_names()
+    except Exception:
+        disabled = set()
+
+    # ── Primary: use SkillRegistry ───────────────────────────────────────────
+    # Skip when SKILLS_DIR has been patched to a temp path (e.g. by tests)
+    # so that filesystem scanning picks up the patched-in skills instead.
+    registry_skills_count = 0
+    if _skills_dir_is_default():
+        try:
+            from agent.skill_registry import registry
+
+            for entry in registry.get_all_skills():
+                name = entry.name
+                if name in disabled:
+                    continue
+
+                cmd_name = _normalize_skill_slug(name)
+                if not cmd_name:
+                    continue
+
+                _skill_commands[f"/{cmd_name}"] = {
+                    "name": name,
+                    "description": entry.description or f"Invoke the {name} skill",
+                    "skill_md_path": str(entry.path),
+                    "skill_dir": str(entry.path.parent),
+                }
+                registry_skills_count += 1
+        except Exception:
+            registry_skills_count = 0  # registry cold-start or unavailable
+
+    # ── Fallback: filesystem scan when registry is cold or SKILLS_DIR patched ─
+    if registry_skills_count == 0:
+        _scan_skill_commands_from_filesystem(disabled)
+
+    return _skill_commands
+
+
+def _scan_skill_commands_from_filesystem(disabled: "set[str]") -> None:
+    """Filesystem scan used as fallback when SkillRegistry is cold."""
+    try:
+        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform
+        from agent.skill_utils import get_external_skills_dirs
+
         dirs_to_scan = []
         if SKILLS_DIR.exists():
             dirs_to_scan.append(SKILLS_DIR)
@@ -228,34 +285,24 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         for scan_dir in dirs_to_scan:
             for skill_md in scan_dir.rglob("SKILL.md"):
-                if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
+                if any(part in (".git", ".github", ".hub") for part in skill_md.parts):
                     continue
                 try:
-                    content = skill_md.read_text(encoding='utf-8')
+                    content = skill_md.read_text(encoding="utf-8")
                     frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):
                         continue
-                    name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
-                        continue
-                    # Respect user's disabled skills config
+                    name = frontmatter.get("name", skill_md.parent.name)
                     if name in disabled:
                         continue
-                    description = frontmatter.get('description', '')
+                    description = frontmatter.get("description", "")
                     if not description:
-                        for line in body.strip().split('\n'):
+                        for line in body.strip().split("\n"):
                             line = line.strip()
-                            if line and not line.startswith('#'):
+                            if line and not line.startswith("#"):
                                 description = line[:80]
                                 break
-                    seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
+                    cmd_name = _normalize_skill_slug(name)
                     if not cmd_name:
                         continue
                     _skill_commands[f"/{cmd_name}"] = {
@@ -268,7 +315,24 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+
+
+def _normalize_skill_slug(name: str) -> str:
+    """Normalize a skill name to a hyphen-separated Telegram-safe slug."""
+    slug = name.lower().replace(" ", "-").replace("_", "-")
+    slug = _SKILL_INVALID_CHARS.sub("", slug)
+    slug = _SKILL_MULTI_HYPHEN.sub("-", slug).strip("-")
+    return slug
+
+
+def _get_disabled_skill_names() -> "set[str]":
+    """Load the user's disabled-skill list.  Calls tools.skills_tool._get_disabled_skill_names."""
+    try:
+        from tools.skills_tool import _get_disabled_skill_names
+
+        return _get_disabled_skill_names()
+    except Exception:
+        return set()
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -276,6 +340,16 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     if not _skill_commands:
         scan_skill_commands()
     return _skill_commands
+
+
+def reset_skill_commands_cache() -> None:
+    """Clear the in-process skill-commands cache.
+
+    Call this after installing, uninstalling, or editing a skill so the
+    next ``get_skill_commands()`` call picks up the updated state.
+    """
+    global _skill_commands
+    _skill_commands = {}
 
 
 def resolve_skill_command_key(command: str) -> Optional[str]:

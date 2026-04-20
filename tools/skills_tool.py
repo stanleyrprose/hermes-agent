@@ -1189,7 +1189,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
-        legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
+        legacy_env_vars, legacy_commands = _collect_prerequisite_values(frontmatter)
         required_env_vars = _get_required_environment_variables(
             frontmatter, legacy_env_vars
         )
@@ -1213,6 +1213,37 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             env_snapshot=env_snapshot,
         )
         setup_needed = bool(remaining_missing_required_envs)
+
+        # ── Check commands from prerequisites.commands ────────────────────────
+        required_commands: List[Dict[str, Any]] = []
+        missing_required_commands: List[str] = []
+        if legacy_commands:
+            import shutil
+
+            for cmd in legacy_commands:
+                cmd_str = str(cmd).strip()
+                if not cmd_str:
+                    continue
+                found = bool(shutil.which(cmd_str))
+                required_commands.append({"name": cmd_str, "available": found})
+                if not found:
+                    missing_required_commands.append(cmd_str)
+                    setup_needed = True
+
+        # ── Call check_fn from SkillRegistry (Gap 1) ───────────────────────
+        # If the skill is registered and has a check_fn, call it to determine
+        # whether any additional runtime requirements are met.
+        check_fn_passed = True
+        try:
+            from agent.skill_registry import registry
+
+            fn = registry.check_fn_for_skill(skill_name)
+            if fn is not None:
+                check_fn_passed = bool(fn())
+                if not check_fn_passed:
+                    setup_needed = True
+        except Exception:
+            pass  # SkillRegistry unavailable or skill not registered — skip silently
 
         # Register available skill env vars so they pass through to sandboxed
         # execution environments (execute_code, terminal).  Only vars that are
@@ -1269,10 +1300,10 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             if linked_files
             else None,
             "required_environment_variables": required_env_vars,
-            "required_commands": [],
+            "required_commands": required_commands,
             "missing_required_environment_variables": remaining_missing_required_envs,
             "missing_credential_files": missing_cred_files,
-            "missing_required_commands": [],
+            "missing_required_commands": missing_required_commands,
             "setup_needed": setup_needed,
             "setup_skipped": capture_result["setup_skipped"],
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value

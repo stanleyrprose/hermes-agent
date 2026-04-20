@@ -21,7 +21,8 @@ def _make_voice_cli(**overrides):
     from cli import HermesCLI
 
     cli = HermesCLI.__new__(HermesCLI)
-    cli._voice_lock = threading.Lock()
+    cli._voice_lock = threading.RLock()
+    cli._attached_images = []
     cli._voice_mode = False
     cli._voice_tts = False
     cli._voice_recorder = None
@@ -1091,12 +1092,12 @@ class TestVoiceStopAndTranscribeReal:
     @patch("cli.os.unlink")
     @patch("cli.os.path.isfile", return_value=True)
     @patch("hermes_cli.config.load_config", return_value={"stt": {}})
-    @patch("tools.voice_mode.transcribe_recording",
-           return_value={"success": True, "transcript": "hello world"})
+    @patch("tools.voice_mode.transcribe_recording")
     @patch("tools.voice_mode.play_beep")
     def test_successful_transcription_queues_input(
         self, _beep, _tr, _cfg, _isf, _unl, _cp
     ):
+        _tr.return_value = {"success": True, "transcript": "hello world"}
         recorder = MagicMock()
         recorder.stop.return_value = "/tmp/test.wav"
         cli = _make_voice_cli(_voice_recording=True, _voice_recorder=recorder)
