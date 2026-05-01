@@ -197,6 +197,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-haiku-4-5-20251001",
     ],
     "deepseek": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
         "deepseek-chat",
         "deepseek-reasoner",
     ],
@@ -1428,6 +1430,36 @@ def normalize_copilot_model_id(
             return _COPILOT_MODEL_ALIASES[candidate]
         if candidate in catalog_ids:
             return candidate
+
+    # Also try the hyphen->dot version of the bare name (without provider prefix)
+    # so that native hyphenated IDs like claude-opus-4-6 can match alias entries
+    # that use the dot form like anthropic/claude-opus-4.6 -> claude-opus-4.6.
+    if "-" in raw:
+        from hermes_cli.model_normalize import _hyphens_to_dots
+
+        dot_raw = _hyphens_to_dots(raw)
+        if dot_raw != raw and dot_raw not in seen:
+            seen.add(dot_raw)
+            if dot_raw in _COPILOT_MODEL_ALIASES:
+                return _COPILOT_MODEL_ALIASES[dot_raw]
+            if dot_raw in catalog_ids:
+                return dot_raw
+
+    # If the bare name contains hyphens, also try the dot form before returning
+    # it unchanged.  This catches cases like "claude-opus-4-6" where the alias
+    # table has no bare-key entry but "claude-opus-4.6" or "anthropic/claude-opus-4.6"
+    # is a known alias.
+    if "-" in raw:
+        from hermes_cli.model_normalize import _hyphens_to_dots
+
+        dot_raw = _hyphens_to_dots(raw)
+        if dot_raw in _COPILOT_MODEL_ALIASES:
+            return _COPILOT_MODEL_ALIASES[dot_raw]
+        # Also try the provider-prefixed dot form (e.g. "anthropic/claude-opus-4.6")
+        for prefix in ("anthropic/", "openai/"):
+            prefixed_dot = prefix + dot_raw
+            if prefixed_dot in _COPILOT_MODEL_ALIASES:
+                return _COPILOT_MODEL_ALIASES[prefixed_dot]
 
     if "/" in raw:
         return raw.split("/", 1)[1].strip()

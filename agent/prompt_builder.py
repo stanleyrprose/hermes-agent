@@ -253,6 +253,22 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "</missing_context>"
 )
 
+# Sequential Thinking — Deep Think guidance for complex tasks.
+# Inspired by Anthropic's Sequential Thinking framework.
+# Triggers when web_search is available and the query involves:
+# policy analysis, multi-step coding, factual grounding, solution design.
+DEEP_THINK_GUIDANCE = (
+    "# Deep Thinking — Sequential Thinking discipline\n"
+    "When facing complex decisions, policy analysis, multi-step coding tasks,\n"
+    "or questions requiring factual grounding:\n"
+    "1. List your reasoning steps before acting\n"
+    "2. Think for a minimum of 4 iterations before giving a final answer\n"
+    "3. Verify facts with web_search — if your reasoning contains a factual claim,\n"
+    "   search it before proceeding\n"
+    "4. Revise when new information contradicts your assumption\n"
+    "5. Do not let early errors compound\n"
+)
+
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
 GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
@@ -632,10 +648,8 @@ def build_skills_system_prompt(
     are read-only — they appear in the index but new skills are always created
     in the local dir.  Local skills take precedence when names collide.
     """
-    # Ensure external skills are registered in SkillRegistry (lazy, idempotent)
-    from agent.skill_utils import register_external_skills
-
-    register_external_skills()
+    # TODO: register_external_skills() not yet implemented — external dir scanning
+    # is handled by skill_utils.get_all_skills_dirs() directly.
 
     hermes_home = get_hermes_home()
     skills_dir = hermes_home / "skills"
