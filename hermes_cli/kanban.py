@@ -570,6 +570,42 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_ctx.add_argument("task_id")
 
+    # --- specify --- (triage → todo via auxiliary LLM)
+    p_specify = sub.add_parser(
+        "specify",
+        help="Flesh out a triage-column task into a concrete spec "
+             "(title + body) and promote it to todo. Uses the auxiliary "
+             "LLM configured under auxiliary.triage_specifier.",
+    )
+    p_specify.add_argument(
+        "task_id",
+        nargs="?",
+        default=None,
+        help="Task id to specify (required unless --all is given)",
+    )
+    p_specify.add_argument(
+        "--all",
+        dest="all_triage",
+        action="store_true",
+        help="Specify every task currently in the triage column",
+    )
+    p_specify.add_argument(
+        "--tenant",
+        default=None,
+        help="When used with --all, restrict the sweep to this tenant",
+    )
+    p_specify.add_argument(
+        "--author",
+        default=None,
+        help="Author name recorded on the audit comment "
+             "(default: $HERMES_PROFILE or 'specifier')",
+    )
+    p_specify.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one JSON object per task on stdout",
+    )
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -684,6 +720,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "notify-list":        _cmd_notify_list,
         "notify-unsubscribe": _cmd_notify_unsubscribe,
         "context":  _cmd_context,
+        "specify":  _cmd_specify,
         "gc":       _cmd_gc,
     }
     handler = handlers.get(action)
@@ -1980,6 +2017,80 @@ def _cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_specify(args: argparse.Namespace) -> int:
+    """Flesh out a triage task (or all of them) via auxiliary LLM,
+    then promote to todo. Thin wrapper over ``kanban_specify``."""
+    from hermes_cli import kanban_specify as spec
+
+    all_flag = bool(getattr(args, "all_triage", False))
+    tenant = getattr(args, "tenant", None)
+    author = getattr(args, "author", None) or _profile_author()
+    want_json = bool(getattr(args, "json", False))
+
+    if args.task_id and all_flag:
+        print(
+            "kanban: pass either a task id OR --all, not both",
+            file=sys.stderr,
+        )
+        return 2
+
+    if all_flag:
+        ids = spec.list_triage_ids(tenant=tenant)
+        if not ids:
+            msg = (
+                "No triage tasks"
+                + (f" for tenant {tenant!r}" if tenant else "")
+                + "."
+            )
+            if want_json:
+                print(json.dumps({"specified": 0, "total": 0}))
+            else:
+                print(msg)
+            return 0
+    elif args.task_id:
+        ids = [args.task_id]
+    else:
+        print(
+            "kanban: specify requires a task id or --all",
+            file=sys.stderr,
+        )
+        return 2
+
+    ok_count = 0
+    fail_count = 0
+    for tid in ids:
+        outcome = spec.specify_task(tid, author=author)
+        if outcome.ok:
+            ok_count += 1
+        else:
+            fail_count += 1
+        if want_json:
+            print(json.dumps({
+                "task_id": outcome.task_id,
+                "ok": outcome.ok,
+                "reason": outcome.reason,
+                "new_title": outcome.new_title,
+            }))
+        else:
+            if outcome.ok:
+                title_suffix = (
+                    f" — retitled: {outcome.new_title!r}"
+                    if outcome.new_title
+                    else ""
+                )
+                print(f"Specified {outcome.task_id} → todo{title_suffix}")
+            else:
+                print(
+                    f"kanban: specify {outcome.task_id}: {outcome.reason}",
+                    file=sys.stderr,
+                )
+    if not all_flag:
+        return 0 if ok_count == 1 else 1
+    # --all: succeed if at least one promotion landed; exit 1 only when
+    # every candidate failed (honest signal for scripts).
+    return 0 if (ok_count > 0 or not ids) else 1
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
@@ -2025,6 +2136,29 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 # Slash-command entry point (used by /kanban from CLI and gateway)
 # ---------------------------------------------------------------------------
 
+_SLASH_KANBAN_HELP = """\
+**/kanban** — manage the shared task board.
+
+Common subcommands:
+  `list` (alias `ls`)   List tasks on the current board
+  `show <id>`           Task details + comments + events
+  `stats`               Per-status / per-assignee counts
+  `create <title>…`     Create a task (auto-subscribes you to events)
+  `comment <id> <msg>`  Append a comment
+  `complete <id>…`      Mark task(s) done
+  `block <id> [reason]` Mark blocked; `unblock <id>` to revive
+  `assign <id> <profile>`  Reassign
+  `boards list`         Show all boards
+  `assignees`           Known profiles + counts
+  `context <id>`        Full worker-context dump
+  `runs <id>`           Attempt history
+  `log <id>`            Worker log
+
+Run `/kanban <subcommand> -h` for arguments. \
+Read-only commands are safe while an agent is running.\
+"""
+
+
 def run_slash(rest: str) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
@@ -2037,26 +2171,47 @@ def run_slash(rest: str) -> str:
 
     tokens = shlex.split(rest) if rest and rest.strip() else []
 
-    parser = argparse.ArgumentParser(prog="/kanban", add_help=False)
-    parser.exit_on_error = False  # type: ignore[attr-defined]
-    sub = parser.add_subparsers(dest="kanban_action")
-    # Reuse the argparse builder -- call it with a throwaway parent
-    # subparsers via a wrapping top-level parser.
-    wrap = argparse.ArgumentParser(prog="/", add_help=False)
-    wrap.exit_on_error = False  # type: ignore[attr-defined]
-    wrap_sub = wrap.add_subparsers(dest="_top")
-    build_parser(wrap_sub)
+    # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
+    # show the curated short-help block instead of dumping argparse's full
+    # usage tree (which is enormous and reads as garbage in a chat
+    # bubble).  Per-subcommand help still works via ``/kanban foo -h``.
+    if not tokens or tokens[0] in {"help", "--help", "-h", "?"}:
+        return _SLASH_KANBAN_HELP
+
+    # Single argparse tree rooted at "/kanban".  build_parser() expects a
+    # subparsers action to attach to, so build a throwaway one and pull
+    # the kanban_parser back out — then drive it directly so usage/error
+    # text reads as ``/kanban`` (not ``/kanban-wrap kanban``).
+    _wrap = argparse.ArgumentParser(prog="/kanban-wrap", add_help=False)
+    _wrap.exit_on_error = False  # type: ignore[attr-defined]
+    _top_sub = _wrap.add_subparsers(dest="_top")
+    kanban_parser = build_parser(_top_sub)
+    kanban_parser.prog = "/kanban"
+    kanban_parser.exit_on_error = False  # type: ignore[attr-defined]
+    for _action in kanban_parser._actions:
+        if isinstance(_action, argparse._SubParsersAction):
+            for _name, _choice in _action.choices.items():
+                _choice.prog = f"/kanban {_name}"
+                _choice.exit_on_error = False  # type: ignore[attr-defined]
 
     buf_out = io.StringIO()
     buf_err = io.StringIO()
+    # ``-h`` / ``--help`` makes argparse print to stdout and SystemExit(0).
+    # Capture both streams so neither the help text nor the error text
+    # bypasses our buffer.
     try:
-        # Prepend the "kanban" token so our top-level subparser routes here.
-        argv = ["kanban", *tokens] if tokens else ["kanban"]
-        args = wrap.parse_args(argv)
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            args = kanban_parser.parse_args(tokens)
     except SystemExit as exc:
-        return f"(usage error: {exc})"
+        out = buf_out.getvalue().rstrip()
+        err = buf_err.getvalue().rstrip()
+        # Help dump (exit 0) → return the captured help text directly.
+        if exc.code in (0, None) and out:
+            return out
+        body = err or out
+        return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"
     except argparse.ArgumentError as exc:
-        return f"(usage error: {exc})"
+        return f"⚠ /kanban usage error: {exc}"
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:
