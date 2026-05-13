@@ -310,6 +310,10 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        # DeepSeek V4: disable thinking by default (causes issues if enabled)
+        if provider_name == "deepseek":
+            api_kwargs["thinking"] = {"type": "disabled"}
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
